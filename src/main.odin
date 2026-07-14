@@ -28,16 +28,23 @@ print_usage :: proc() {
 	}
 	fmt.eprintf(
 		`Usage: %s [-j N] [-c N] <file|directory|pattern> ...
+       %s -x <archive.tgz> [dest_dir]
+
+  Backup (default):
+    Files  → copy to <path>.<timestamp>
+    Dirs   → <path>.<timestamp>.tgz  (ustar + gzip level 1; symlinks/hardlinks)
+
+  Extract:
+    -x     Unpack .tgz / .tar.gz into dest_dir (default: .)
 
   -j N   Max entities to process in parallel (default: CPU count)
-  -c N   Cores for DEFLATE inside each zip (default: CPU count)
-
-  Files:  copy to <path>.<timestamp>
-  Dirs:   zip  to <path>.<timestamp>.zip  (DEFLATE level 1)
+  -c N   Parallel entry prep while building tar (default: CPU count)
+         Note: gzip stream itself is serial
 
   Prints only: src -> dst
   Errors go to stderr.
 `,
+		prog,
 		prog,
 	)
 }
@@ -75,10 +82,20 @@ entity_task :: proc(t: thread.Task) {
 		return
 	}
 
+	// Prefer lstat so a top-level symlink is not misclassified.
+	info, err := os.lstat(src, context.allocator)
+	if err != nil {
+		eprintfln("Error: lstat %s: %v", src, err)
+		job.ok = false
+		return
+	}
+	defer os.file_info_delete(info, context.allocator)
+
+	// Follow for classification of top-level path (dir vs file); tree walk uses lstat.
 	if os.is_directory(src) {
 		dst := strings.clone(dest_for_dir(src, job.ts))
 		defer delete(dst)
-		if zip_directory(src, dst, job.zip_cores) {
+		if tar_directory(src, dst, job.zip_cores) {
 			print_src_dst(src, dst)
 			job.ok = true
 		} else {
@@ -87,11 +104,11 @@ entity_task :: proc(t: thread.Task) {
 		return
 	}
 
-	if os.is_file(src) {
+	if os.is_file(src) || info.type == .Regular || info.type == .Symlink {
 		dst := strings.clone(dest_for_file(src, job.ts))
 		defer delete(dst)
-		if err := copy_file_preserve(dst, src); err != nil {
-			eprintfln("Error: copy %s -> %s: %v", src, dst, err)
+		if cerr := copy_file_preserve(dst, src); cerr != nil {
+			eprintfln("Error: copy %s -> %s: %v", src, dst, cerr)
 			job.ok = false
 			return
 		}
@@ -114,6 +131,10 @@ main :: proc() {
 		cores_n = 1
 	}
 
+	extract_mode := false
+	extract_archive: string
+	extract_dest := "."
+
 	patterns := make([dynamic]string)
 	defer delete(patterns)
 
@@ -124,6 +145,11 @@ main :: proc() {
 		if a == "-h" || a == "--help" {
 			print_usage()
 			os.exit(2)
+		}
+		if a == "-x" {
+			extract_mode = true
+			i += 1
+			continue
 		}
 		if a == "-j" {
 			if i + 1 >= len(args) {
@@ -184,6 +210,23 @@ main :: proc() {
 		i += 1
 	}
 
+	if extract_mode {
+		if len(patterns) < 1 || len(patterns) > 2 {
+			eprintfln("Error: -x requires <archive.tgz> [dest_dir]")
+			print_usage()
+			os.exit(2)
+		}
+		extract_archive = patterns[0]
+		if len(patterns) == 2 {
+			extract_dest = patterns[1]
+		}
+		if extract_tgz(extract_archive, extract_dest) {
+			print_src_dst(extract_archive, extract_dest)
+			os.exit(0)
+		}
+		os.exit(1)
+	}
+
 	if len(patterns) == 0 {
 		print_usage()
 		os.exit(2)
@@ -204,7 +247,6 @@ main :: proc() {
 	ts := strings.clone(timestamp_now())
 	defer delete(ts)
 
-	// Cap entity workers to number of paths.
 	entity_workers := min(jobs_n, len(paths))
 	entity_workers = max(1, entity_workers)
 
@@ -222,13 +264,7 @@ main :: proc() {
 			zip_cores = cores_n,
 			ok        = false,
 		}
-		thread.pool_add_task(
-			&pool,
-			context.allocator,
-			entity_task,
-			&entity_jobs[idx],
-			idx,
-		)
+		thread.pool_add_task(&pool, context.allocator, entity_task, &entity_jobs[idx], idx)
 	}
 
 	thread.pool_start(&pool)

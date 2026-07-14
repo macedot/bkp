@@ -101,11 +101,11 @@ dest_for_file :: proc(src, ts: string) -> string {
 }
 
 dest_for_dir :: proc(src, ts: string) -> string {
-	return fmt.tprintf("%s.%s.zip", src, ts)
+	return fmt.tprintf("%s.%s.tgz", src, ts)
 }
 
-// archive_entry_name builds ZIP entry path with forward slashes.
-// src_root is the directory being zipped (no trailing slash).
+// archive_entry_name builds tar member path with forward slashes.
+// src_root is the directory being archived (no trailing slash).
 // base_name is filepath.base(src_root).
 archive_entry_name :: proc(src_root, fullpath, base_name: string, is_dir: bool) -> string {
 	root := strip_trailing_slashes(src_root)
