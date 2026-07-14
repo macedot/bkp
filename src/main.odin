@@ -1,0 +1,247 @@
+package main
+
+import "core:fmt"
+import "core:os"
+import "core:strconv"
+import "core:strings"
+import "core:sync"
+import "core:thread"
+
+io_mu: sync.Mutex
+
+eprintfln :: proc(format: string, args: ..any) {
+	sync.mutex_lock(&io_mu)
+	defer sync.mutex_unlock(&io_mu)
+	fmt.eprintfln(format, ..args)
+}
+
+print_src_dst :: proc(src, dst: string) {
+	sync.mutex_lock(&io_mu)
+	defer sync.mutex_unlock(&io_mu)
+	fmt.printfln("%s -> %s", src, dst)
+}
+
+print_usage :: proc() {
+	prog := "bkp"
+	if len(os.args) > 0 {
+		prog = os.args[0]
+	}
+	fmt.eprintf(
+		`Usage: %s [-j N] [-c N] <file|directory|pattern> ...
+
+  -j N   Max entities to process in parallel (default: CPU count)
+  -c N   Cores for DEFLATE inside each zip (default: CPU count)
+
+  Files:  copy to <path>.<timestamp>
+  Dirs:   zip  to <path>.<timestamp>.zip  (DEFLATE level 1)
+
+  Prints only: src -> dst
+  Errors go to stderr.
+`,
+		prog,
+	)
+}
+
+parse_int_flag :: proc(s: string) -> (n: int, ok: bool) {
+	v, ok2 := strconv.parse_int(s)
+	if !ok2 || v < 1 {
+		return 0, false
+	}
+	return v, true
+}
+
+Entity_Job :: struct {
+	src:       string,
+	ts:        string,
+	zip_cores: int,
+	ok:        bool,
+}
+
+entity_task :: proc(t: thread.Task) {
+	job := cast(^Entity_Job)t.data
+	src := strip_trailing_slashes(job.src)
+
+	if is_dot_or_dotdot(src) {
+		eprintfln(
+			"Error: Cannot backup '.' or '..' directly. Pass a named file or directory instead.",
+		)
+		job.ok = false
+		return
+	}
+
+	if !os.exists(src) {
+		eprintfln("Error: Not found: %s", src)
+		job.ok = false
+		return
+	}
+
+	if os.is_directory(src) {
+		dst := strings.clone(dest_for_dir(src, job.ts))
+		defer delete(dst)
+		if zip_directory(src, dst, job.zip_cores) {
+			print_src_dst(src, dst)
+			job.ok = true
+		} else {
+			job.ok = false
+		}
+		return
+	}
+
+	if os.is_file(src) {
+		dst := strings.clone(dest_for_file(src, job.ts))
+		defer delete(dst)
+		if err := copy_file_preserve(dst, src); err != nil {
+			eprintfln("Error: copy %s -> %s: %v", src, dst, err)
+			job.ok = false
+			return
+		}
+		print_src_dst(src, dst)
+		job.ok = true
+		return
+	}
+
+	eprintfln("Error: Unsupported file type: %s", src)
+	job.ok = false
+}
+
+main :: proc() {
+	jobs_n := os.get_processor_core_count()
+	cores_n := jobs_n
+	if jobs_n < 1 {
+		jobs_n = 1
+	}
+	if cores_n < 1 {
+		cores_n = 1
+	}
+
+	patterns := make([dynamic]string)
+	defer delete(patterns)
+
+	args := os.args[1:]
+	i := 0
+	for i < len(args) {
+		a := args[i]
+		if a == "-h" || a == "--help" {
+			print_usage()
+			os.exit(2)
+		}
+		if a == "-j" {
+			if i + 1 >= len(args) {
+				eprintfln("Error: -j requires a number")
+				print_usage()
+				os.exit(2)
+			}
+			n, ok := parse_int_flag(args[i + 1])
+			if !ok {
+				eprintfln("Error: invalid -j value: %s", args[i + 1])
+				os.exit(2)
+			}
+			jobs_n = n
+			i += 2
+			continue
+		}
+		if strings.has_prefix(a, "-j") && len(a) > 2 {
+			n, ok := parse_int_flag(a[2:])
+			if !ok {
+				eprintfln("Error: invalid -j value: %s", a[2:])
+				os.exit(2)
+			}
+			jobs_n = n
+			i += 1
+			continue
+		}
+		if a == "-c" {
+			if i + 1 >= len(args) {
+				eprintfln("Error: -c requires a number")
+				print_usage()
+				os.exit(2)
+			}
+			n, ok := parse_int_flag(args[i + 1])
+			if !ok {
+				eprintfln("Error: invalid -c value: %s", args[i + 1])
+				os.exit(2)
+			}
+			cores_n = n
+			i += 2
+			continue
+		}
+		if strings.has_prefix(a, "-c") && len(a) > 2 {
+			n, ok := parse_int_flag(a[2:])
+			if !ok {
+				eprintfln("Error: invalid -c value: %s", a[2:])
+				os.exit(2)
+			}
+			cores_n = n
+			i += 1
+			continue
+		}
+		if strings.has_prefix(a, "-") {
+			eprintfln("Error: unknown option: %s", a)
+			print_usage()
+			os.exit(2)
+		}
+		append(&patterns, a)
+		i += 1
+	}
+
+	if len(patterns) == 0 {
+		print_usage()
+		os.exit(2)
+	}
+
+	paths, expand_err := expand_patterns(patterns[:])
+	defer {
+		for p in paths {
+			delete(p)
+		}
+		delete(paths)
+	}
+
+	if len(paths) == 0 {
+		os.exit(1)
+	}
+
+	ts := strings.clone(timestamp_now())
+	defer delete(ts)
+
+	// Cap entity workers to number of paths.
+	entity_workers := min(jobs_n, len(paths))
+	entity_workers = max(1, entity_workers)
+
+	entity_jobs := make([]Entity_Job, len(paths))
+	defer delete(entity_jobs)
+
+	pool: thread.Pool
+	thread.pool_init(&pool, context.allocator, entity_workers)
+	defer thread.pool_destroy(&pool)
+
+	for p, idx in paths {
+		entity_jobs[idx] = Entity_Job {
+			src       = p,
+			ts        = ts,
+			zip_cores = cores_n,
+			ok        = false,
+		}
+		thread.pool_add_task(
+			&pool,
+			context.allocator,
+			entity_task,
+			&entity_jobs[idx],
+			idx,
+		)
+	}
+
+	thread.pool_start(&pool)
+	thread.pool_finish(&pool)
+
+	any_fail := expand_err
+	for j in entity_jobs {
+		if !j.ok {
+			any_fail = true
+		}
+	}
+
+	if any_fail {
+		os.exit(1)
+	}
+}

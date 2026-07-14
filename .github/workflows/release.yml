@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-amd64
+            asset: bkp-linux-amd64
+            exe: bkp
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            asset: bkp-linux-arm64
+            exe: bkp
+          - os: macos-14
+            target: darwin-arm64
+            asset: bkp-darwin-arm64
+            exe: bkp
+          - os: windows-latest
+            target: windows-amd64
+            asset: bkp-windows-amd64.exe
+            exe: bkp.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Odin
+        uses: laytan/setup-odin@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          release: latest
+
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -euo pipefail
+          make OUT="${{ matrix.exe }}"
+          test -x "${{ matrix.exe }}"
+          mkdir -p dist
+          cp "${{ matrix.exe }}" "dist/${{ matrix.asset }}"
+          # Smoke: no args prints usage, exit 2
+          set +e
+          "./${{ matrix.exe }}" >/dev/null 2>&1
+          code=$?
+          set -e
+          test "$code" -eq 2
+
+      - name: Enable MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          if not exist build mkdir build
+          if not exist dist mkdir dist
+          cl /nologo /O2 /Ivendor /c vendor\miniz.c /Fobuild\miniz.obj
+          if errorlevel 1 exit /b 1
+          cl /nologo /O2 /Ivendor /c vendor\bkp_miniz_wrap.c /Fobuild\bkp_miniz_wrap.obj
+          if errorlevel 1 exit /b 1
+          lib /nologo /OUT:build\bkpminiz.lib build\miniz.obj build\bkp_miniz_wrap.obj
+          if errorlevel 1 exit /b 1
+          odin build src -out:bkp.exe -o:speed
+          if errorlevel 1 exit /b 1
+          copy /Y bkp.exe dist\bkp-windows-amd64.exe
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

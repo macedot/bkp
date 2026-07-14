@@ -1,0 +1,34 @@
+# Deny all (whitelist mode)
+*
+
+# Allow directories to be traversed
+!*/
+
+# Allow only what this repo needs
+!.gitignore
+!README.md
+!Makefile
+!src/
+!src/**
+!vendor/
+!vendor/**
+!testdata/
+!testdata/**
+!.github/
+!.github/**
+
+# Still deny build artifacts / junk inside allowed trees
+src/**/*.o
+src/**/*.obj
+vendor/**/*.o
+vendor/**/*.obj
+*.o
+*.obj
+*.lib
+bkp
+bkp.exe
+*.zip
+*.dylib
+*.so
+*.a
+.DS_Store
