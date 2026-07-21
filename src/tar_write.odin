@@ -1,6 +1,7 @@
 package main
 
 import "core:c"
+import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
@@ -23,6 +24,18 @@ Tar_Entry :: struct {
 	size:       i64,
 	data:       []u8, // file payload only
 }
+
+Tar_Pack_Progress :: struct {
+	label:             string,
+	total_entries:      int,
+	packed_entries:     int,
+	total_payload:      i64,
+	packed_payload:     i64,
+	last_render_entries: int,
+	last_render_width:  int,
+}
+
+PROGRESS_ENTRY_STEP :: 32
 
 // tar_directory writes src tree to dst_tgz as gzip-compressed ustar (.tgz).
 // compress_workers kept for API compatibility; gzip stream is serial.
@@ -47,15 +60,22 @@ tar_directory :: proc(src_path, dst_tgz: string, compress_workers: int) -> bool 
 	}
 	defer destroy_tar_entries(entries)
 
+	progress := new_tar_pack_progress(base_name, entries)
+	render_pack_progress(&progress, true)
+
 	tar_buf := make([dynamic]u8)
 	defer delete(tar_buf)
 
 	for &e in entries {
 		if !append_tar_entry(&tar_buf, &e) {
+			finish_pack_progress(&progress, false)
 			eprintfln("Error: Failed to pack entry: %s", e.fullpath)
 			return false
 		}
+		advance_pack_progress(&progress, &e)
 	}
+	finish_pack_progress(&progress, false)
+	print_progress_update(progress_phase_line(base_name, "Compressing gzip stream"))
 	// Two zero blocks end the archive.
 	append_zeros(&tar_buf, 1024)
 
@@ -66,18 +86,125 @@ tar_directory :: proc(src_path, dst_tgz: string, compress_workers: int) -> bool 
 	out_len: c.size_t
 	gz := bkp_gzip_compress(src_ptr, c.size_t(len(tar_buf)), &out_len)
 	if gz == nil {
+		finish_pack_progress(&progress, false)
 		eprintfln("Error: gzip compress failed for %s", src)
 		return false
 	}
 	defer bkp_free(gz)
 
 	gz_slice := ([^]u8)(gz)[:int(out_len)]
+	print_progress_update(progress_phase_line(base_name, "Writing archive"))
 	if err := os.write_entire_file(dst_tgz, gz_slice); err != nil {
+		finish_pack_progress(&progress, false)
 		_ = os.remove(dst_tgz)
 		eprintfln("Error: write %s: %v", dst_tgz, err)
 		return false
 	}
+	finish_pack_progress(&progress, true)
 	return true
+}
+
+new_tar_pack_progress :: proc(label: string, entries: [dynamic]Tar_Entry) -> Tar_Pack_Progress {
+	total_payload: i64
+	for e in entries {
+		if e.kind == .File {
+			total_payload += e.size
+		}
+	}
+	return Tar_Pack_Progress {
+		label         = label,
+		total_entries = len(entries),
+		total_payload = total_payload,
+	}
+}
+
+advance_pack_progress :: proc(p: ^Tar_Pack_Progress, e: ^Tar_Entry) {
+	p.packed_entries += 1
+	if e.kind == .File {
+		p.packed_payload += e.size
+	}
+	render_pack_progress(p, false)
+}
+
+render_pack_progress :: proc(p: ^Tar_Pack_Progress, force: bool) {
+	if quiet_mode {
+		return
+	}
+	if !force {
+		if p.packed_entries != p.total_entries {
+			if p.packed_entries-p.last_render_entries < PROGRESS_ENTRY_STEP {
+				return
+			}
+		}
+	}
+
+	percent := 100.0
+	if p.total_entries > 0 {
+		percent = 100.0 * f64(p.packed_entries) / f64(p.total_entries)
+	}
+	msg := fmt.tprintf(
+		"Packing %s: %d/%d entries (%.1f%%), %s/%s",
+		p.label,
+		p.packed_entries,
+		p.total_entries,
+		percent,
+		human_payload(p.packed_payload),
+		human_payload(p.total_payload),
+	)
+
+	if p.last_render_width > len(msg) {
+		pad := p.last_render_width - len(msg)
+		msg = fmt.tprintf("%s%s", msg, strings.repeat(" ", pad, context.temp_allocator))
+	}
+
+	print_progress_update(msg)
+	p.last_render_entries = p.packed_entries
+	p.last_render_width = len(msg)
+}
+
+finish_pack_progress :: proc(p: ^Tar_Pack_Progress, success: bool) {
+	if quiet_mode {
+		return
+	}
+	if success {
+		percent := 100.0
+		msg := fmt.tprintf(
+			"Packed %s: %d/%d entries (%.1f%%), %s/%s",
+			p.label,
+			p.packed_entries,
+			p.total_entries,
+			percent,
+			human_payload(p.packed_payload),
+			human_payload(p.total_payload),
+		)
+		if p.last_render_width > len(msg) {
+			pad := p.last_render_width - len(msg)
+			msg = fmt.tprintf("%s%s", msg, strings.repeat(" ", pad, context.temp_allocator))
+		}
+		print_progress_update(msg, true)
+		p.last_render_width = len(msg)
+		return
+	}
+	if p.last_render_width > 0 {
+		print_progress_update(strings.repeat(" ", p.last_render_width, context.temp_allocator), true)
+	}
+}
+
+progress_phase_line :: proc(label, phase: string) -> string {
+	return fmt.tprintf("Packing %s: %s", label, phase)
+}
+
+human_payload :: proc(n: i64) -> string {
+	if n < 1024 {
+		return fmt.tprintf("%d B", n)
+	}
+	if n < 1024 * 1024 {
+		return fmt.tprintf("%.1f KiB", f64(n) / 1024.0)
+	}
+	if n < 1024 * 1024 * 1024 {
+		return fmt.tprintf("%.1f MiB", f64(n) / (1024.0 * 1024.0))
+	}
+	return fmt.tprintf("%.1f GiB", f64(n) / (1024.0 * 1024.0 * 1024.0))
 }
 
 collect_tar_entries :: proc(src, base_name: string) -> [dynamic]Tar_Entry {

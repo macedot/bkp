@@ -18,18 +18,22 @@ jobs:
           - os: ubuntu-latest
             target: linux-amd64
             asset: bkp-linux-amd64
+            archive: bkp-linux-amd64.tar.gz
             exe: bkp
           - os: ubuntu-24.04-arm
             target: linux-arm64
             asset: bkp-linux-arm64
+            archive: bkp-linux-arm64.tar.gz
             exe: bkp
           - os: macos-14
             target: darwin-arm64
             asset: bkp-darwin-arm64
+            archive: bkp-darwin-arm64.tar.gz
             exe: bkp
           - os: windows-latest
             target: windows-amd64
             asset: bkp-windows-amd64.exe
+            archive: bkp-windows-amd64.zip
             exe: bkp.exe
 
     steps:
@@ -56,6 +60,7 @@ jobs:
           code=$?
           set -e
           test "$code" -eq 2
+          tar -czf "dist/${{ matrix.archive }}" -C dist "${{ matrix.asset }}"
 
       - name: Enable MSVC environment
         if: runner.os == 'Windows'
@@ -76,10 +81,11 @@ jobs:
           odin build src -out:bkp.exe -o:speed
           if errorlevel 1 exit /b 1
           copy /Y bkp.exe dist\bkp-windows-amd64.exe
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist\\bkp-windows-amd64.exe' -DestinationPath 'dist\\${{ matrix.archive }}' -Force"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/${{ matrix.asset }}
+          files: dist/${{ matrix.archive }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -8,6 +8,7 @@ import "core:sync"
 import "core:thread"
 
 io_mu: sync.Mutex
+quiet_mode: bool
 
 eprintfln :: proc(format: string, args: ..any) {
 	sync.mutex_lock(&io_mu)
@@ -16,9 +17,25 @@ eprintfln :: proc(format: string, args: ..any) {
 }
 
 print_src_dst :: proc(src, dst: string) {
+	if quiet_mode {
+		return
+	}
 	sync.mutex_lock(&io_mu)
 	defer sync.mutex_unlock(&io_mu)
 	fmt.printfln("%s -> %s", src, dst)
+}
+
+print_progress_update :: proc(line: string, done := false) {
+	if quiet_mode {
+		return
+	}
+	sync.mutex_lock(&io_mu)
+	defer sync.mutex_unlock(&io_mu)
+	if done {
+		fmt.printfln("\r%s", line)
+		return
+	}
+	fmt.printf("\r%s", line)
 }
 
 print_usage :: proc() {
@@ -27,7 +44,7 @@ print_usage :: proc() {
 		prog = os.args[0]
 	}
 	fmt.eprintf(
-		`Usage: %s [-j N] [-c N] <file|directory|pattern> ...
+		`Usage: %s [--quiet] [-j N] [-c N] <file|directory|pattern> ...
        %s -x <archive.tgz> [dest_dir]
 
   Backup (default):
@@ -40,8 +57,9 @@ print_usage :: proc() {
   -j N   Max entities to process in parallel (default: CPU count)
   -c N   Parallel entry prep while building tar (default: CPU count)
          Note: gzip stream itself is serial
+	--quiet   Suppress all non-error output
 
-  Prints only: src -> dst
+	Prints only: src -> dst and live pack progress
   Errors go to stderr.
 `,
 		prog,
@@ -148,6 +166,11 @@ main :: proc() {
 		}
 		if a == "-x" {
 			extract_mode = true
+			i += 1
+			continue
+		}
+		if a == "--quiet" {
+			quiet_mode = true
 			i += 1
 			continue
 		}

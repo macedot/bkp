@@ -22,7 +22,8 @@ Written in [Odin](https://odin-lang.org/). Compression uses an embedded [miniz](
 - **Symlinks & hardlinks** — stored correctly in the tar stream (not flattened as ZIP often is)
 - **Extract mode** — `bkp -x archive.tgz [dest]` restores files, dirs, and links safely
 - **Parallel entities** — `-j` processes multiple top-level paths at once
-- **Quiet stdout** — only `src -> dst` lines; errors on stderr
+- **Folder pack progress** — live single-line progress while building `.tgz`
+- **Quiet mode** — `--quiet` suppresses non-error output
 - **Multi-arch releases** — Linux amd64/arm64, macOS Apple Silicon, Windows amd64
 
 ## Quick Start
@@ -50,7 +51,7 @@ make
 ## Usage
 
 ```
-bkp [-j N] [-c N] <file|directory|pattern> ...
+bkp [--quiet] [-j N] [-c N] <file|directory|pattern> ...
 bkp -x <archive.tgz> [dest_dir]
 ```
 
@@ -64,14 +65,17 @@ bkp -x <archive.tgz> [dest_dir]
 |------|---------|-------------|
 | `-j N` | CPU count | Max paths to process in parallel |
 | `-c N` | CPU count | Entry-prep workers while packing (gzip stream is serial) |
+| `--quiet` | off | Suppress all non-error output (progress + `src -> dst`) |
 
 No arguments prints usage and exits with code `2`. Exit `1` if any path fails.
 
-Stdout is **only** mapping lines:
+In default mode, stdout shows live single-line folder packing progress plus mapping lines:
 
 ```
 src -> dst
 ```
+
+Use `--quiet` to keep stdout empty unless an error occurs (errors still go to stderr).
 
 ### Examples
 
@@ -118,10 +122,10 @@ Publishing a GitHub Release runs [`.github/workflows/release.yml`](.github/workf
 
 | Asset | Platform |
 |-------|----------|
-| `bkp-linux-amd64` | Linux x86_64 |
-| `bkp-linux-arm64` | Linux ARM64 |
-| `bkp-darwin-arm64` | macOS Apple Silicon |
-| `bkp-windows-amd64.exe` | Windows x86_64 |
+| `bkp-linux-amd64.tar.gz` | Linux x86_64 |
+| `bkp-linux-arm64.tar.gz` | Linux ARM64 |
+| `bkp-darwin-arm64.tar.gz` | macOS Apple Silicon |
+| `bkp-windows-amd64.zip` | Windows x86_64 |
 
 ## Layout
 

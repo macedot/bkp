@@ -54,5 +54,17 @@ test: $(OUT)
 	test -z "$$(cat "$$TMP/err2")" || (echo "STDERR:" && cat "$$TMP/err2" && exit 1); \
 	test "$$(readlink "$$TMP/out/dir/link.txt")" = "a.txt"; \
 	diff -u "$$TMP/dir/a.txt" "$$TMP/out/dir/hard.txt"; \
+	echo quiet > "$$TMP/q.txt"; \
+	mkdir -p "$$TMP/qd/sub"; \
+	echo zipped > "$$TMP/qd/sub/z.txt"; \
+	QOUT=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" --quiet q.txt qd 2>"$$TMP/errq"); \
+	test -z "$$QOUT" || (echo "Expected empty stdout with --quiet backup" && echo "$$QOUT" && exit 1); \
+	test -z "$$(cat "$$TMP/errq")" || (echo "STDERR (--quiet backup):" && cat "$$TMP/errq" && exit 1); \
+	QTGZ=$$(ls "$$TMP"/qd.*.tgz); \
+	mkdir -p "$$TMP/outq"; \
+	QXOUT=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" --quiet -x "$$(basename "$$QTGZ")" outq 2>"$$TMP/errq2"); \
+	test -z "$$QXOUT" || (echo "Expected empty stdout with --quiet extract" && echo "$$QXOUT" && exit 1); \
+	test -z "$$(cat "$$TMP/errq2")" || (echo "STDERR (--quiet extract):" && cat "$$TMP/errq2" && exit 1); \
+	diff -u "$$TMP/qd/sub/z.txt" "$$TMP/outq/qd/sub/z.txt"; \
 	echo "OK"; \
 	rm -rf "$$TMP"
