@@ -68,32 +68,36 @@ jobs:
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        shell: bash
+        shell: cmd
         run: |
-          set -euo pipefail
-          mkdir -p build dist
+          if not exist build mkdir build
+          if not exist dist mkdir dist
 
-          # Static multi-threaded libzstd via CMake (available on windows-latest).
-          cmake -S vendor/zstd/build/cmake -B build/zstd-cmake \
-            -DZSTD_BUILD_PROGRAMS=OFF \
-            -DZSTD_BUILD_TESTS=OFF \
-            -DZSTD_BUILD_SHARED=OFF \
-            -DZSTD_BUILD_STATIC=ON \
-            -DZSTD_MULTITHREAD_SUPPORT=ON \
-            -DCMAKE_BUILD_TYPE=Release
+          cmake -S vendor/zstd/build/cmake -B build/zstd-cmake -DZSTD_BUILD_PROGRAMS=OFF -DZSTD_BUILD_TESTS=OFF -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_STATIC=ON -DZSTD_MULTITHREAD_SUPPORT=ON -DCMAKE_BUILD_TYPE=Release
+          if errorlevel 1 exit /b 1
           cmake --build build/zstd-cmake --config Release --parallel
+          if errorlevel 1 exit /b 1
 
-          # Locate the static lib produced by CMake (path varies by generator).
-          ZSTD_LIB=$(find build/zstd-cmake -name 'zstd_static.lib' -o -name 'libzstd_static.lib' -o -name 'zstd.lib' | head -1)
-          test -n "$ZSTD_LIB"
-          echo "Using $ZSTD_LIB"
+          rem CMake MSVC output path
+          set ZSTD_LIB=build\zstd-cmake\lib\Release\zstd_static.lib
+          if not exist "%ZSTD_LIB%" set ZSTD_LIB=build\zstd-cmake\lib\zstd_static.lib
+          if not exist "%ZSTD_LIB%" (
+            echo ERROR: zstd_static.lib not found
+            dir /s /b build\zstd-cmake\*.lib
+            exit /b 1
+          )
+          echo Using %ZSTD_LIB%
 
-          cl /nologo /O2 /Ivendor /Ivendor/zstd/lib /c vendor/bkp_zstd_wrap.c /Fobuild/bkp_zstd_wrap.obj
-          lib /nologo /OUT:build/bkpzstd.lib build/bkp_zstd_wrap.obj "$ZSTD_LIB"
+          cl /nologo /O2 /Ivendor /Ivendor/zstd/lib /c vendor\bkp_zstd_wrap.c /Fobuild\bkp_zstd_wrap.obj
+          if errorlevel 1 exit /b 1
+          lib /nologo /OUT:build\bkpzstd.lib build\bkp_zstd_wrap.obj %ZSTD_LIB%
+          if errorlevel 1 exit /b 1
 
           odin build src -out:bkp.exe -o:speed
-          cp bkp.exe "dist/${{ matrix.asset }}"
-          powershell -NoProfile -Command "Compress-Archive -Path 'dist\\${{ matrix.asset }}' -DestinationPath 'dist\\${{ matrix.archive }}' -Force"
+          if errorlevel 1 exit /b 1
+          copy /Y bkp.exe dist\bkp-windows-amd64.exe
+          if errorlevel 1 exit /b 1
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist\\bkp-windows-amd64.exe' -DestinationPath 'dist\\${{ matrix.archive }}' -Force"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2
