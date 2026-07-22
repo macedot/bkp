@@ -68,20 +68,32 @@ jobs:
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
-        shell: cmd
+        shell: bash
         run: |
-          if not exist build mkdir build
-          if not exist dist mkdir dist
-          cl /nologo /O2 /Ivendor /c vendor\miniz.c /Fobuild\miniz.obj
-          if errorlevel 1 exit /b 1
-          cl /nologo /O2 /Ivendor /c vendor\bkp_miniz_wrap.c /Fobuild\bkp_miniz_wrap.obj
-          if errorlevel 1 exit /b 1
-          lib /nologo /OUT:build\bkpminiz.lib build\miniz.obj build\bkp_miniz_wrap.obj
-          if errorlevel 1 exit /b 1
+          set -euo pipefail
+          mkdir -p build dist
+
+          # Static multi-threaded libzstd via CMake (available on windows-latest).
+          cmake -S vendor/zstd/build/cmake -B build/zstd-cmake \
+            -DZSTD_BUILD_PROGRAMS=OFF \
+            -DZSTD_BUILD_TESTS=OFF \
+            -DZSTD_BUILD_SHARED=OFF \
+            -DZSTD_BUILD_STATIC=ON \
+            -DZSTD_MULTITHREAD_SUPPORT=ON \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/zstd-cmake --config Release --parallel
+
+          # Locate the static lib produced by CMake (path varies by generator).
+          ZSTD_LIB=$(find build/zstd-cmake -name 'zstd_static.lib' -o -name 'libzstd_static.lib' -o -name 'zstd.lib' | head -1)
+          test -n "$ZSTD_LIB"
+          echo "Using $ZSTD_LIB"
+
+          cl /nologo /O2 /Ivendor /Ivendor/zstd/lib /c vendor/bkp_zstd_wrap.c /Fobuild/bkp_zstd_wrap.obj
+          lib /nologo /OUT:build/bkpzstd.lib build/bkp_zstd_wrap.obj "$ZSTD_LIB"
+
           odin build src -out:bkp.exe -o:speed
-          if errorlevel 1 exit /b 1
-          copy /Y bkp.exe dist\bkp-windows-amd64.exe
-          powershell -NoProfile -Command "Compress-Archive -Path 'dist\\bkp-windows-amd64.exe' -DestinationPath 'dist\\${{ matrix.archive }}' -Force"
+          cp bkp.exe "dist/${{ matrix.asset }}"
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist\\${{ matrix.asset }}' -DestinationPath 'dist\\${{ matrix.archive }}' -Force"
 
       - name: Upload release asset
         uses: softprops/action-gh-release@v2

@@ -11,18 +11,19 @@
 
 ---
 
-**bkp** is a small, dependency-free CLI for fast local backups. Point it at files or directories and get timestamped copies: plain files are duplicated beside the original; directories become a single **`.tgz`** (ustar + gzip) that preserves **symlinks** and **hardlinks**. Unpack with `bkp -x` or standard `tar`.
+**bkp** is a small, dependency-free CLI for fast local backups. Point it at files or directories and get timestamped copies: plain files are duplicated beside the original; directories become a single **`.tar.zst`** (ustar + zstd) that preserves **symlinks** and **hardlinks**. Unpack with `bkp -x` or `tar` + `zstd` when those tools are available.
 
-Written in [Odin](https://odin-lang.org/). Compression uses an embedded [miniz](https://github.com/richgel999/miniz) (gzip level 1). No system `zlib`, `pigz`, or `zip` required at runtime.
+Written in [Odin](https://odin-lang.org/). Compression uses embedded [zstd](https://github.com/facebook/zstd) (level 1, multi-threaded). No system `zstd` required at runtime.
 
 ## Features
 
 - **Timestamped file copies** — `notes.txt` → `notes.txt.20260714120000` (like `cp -p`)
-- **Directory archives** — `project/` → `project.20260714120000.tgz`
-- **Symlinks & hardlinks** — stored correctly in the tar stream (not flattened as ZIP often is)
-- **Extract mode** — `bkp -x archive.tgz [dest]` restores files, dirs, and links safely
+- **Directory archives** — `project/` → `project.20260714120000.tar.zst`
+- **Symlinks & hardlinks** — stored correctly in the tar stream
+- **Extract mode** — `bkp -x` restores files, dirs, and links safely
 - **Parallel entities** — `-j` processes multiple top-level paths at once
-- **Folder pack progress** — live single-line progress while building `.tgz`
+- **Parallel compress & extract** — `-c` multi-frame zstd (parallel compress + decompress) and parallel file writers
+- **Folder pack progress** — live single-line progress while building archives
 - **Quiet mode** — `--quiet` suppresses non-error output
 - **Multi-arch releases** — Linux amd64/arm64, macOS Apple Silicon, Windows amd64
 
@@ -52,19 +53,19 @@ make
 
 ```
 bkp [--quiet] [-j N] [-c N] <file|directory|pattern> ...
-bkp -x <archive.tgz> [dest_dir]
+bkp [-c N] -x <archive.tar.zst> [dest_dir]
 ```
 
 | Mode | Behavior |
 |------|----------|
 | **File** | Copy to `<path>.<timestamp>` |
-| **Directory** | Pack to `<path>.<timestamp>.tgz` (ustar + gzip level 1) |
-| **`-x`** | Unpack `.tgz` / `.tar.gz` into `dest_dir` (default: `.`) |
+| **Directory** | Pack to `<path>.<timestamp>.tar.zst` (ustar + zstd level 1) |
+| **`-x`** | Unpack `.tar.zst` into `dest_dir` (default: `.`) |
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-j N` | CPU count | Max paths to process in parallel |
-| `-c N` | CPU count | Entry-prep workers while packing (gzip stream is serial) |
+| `-c N` | CPU count | multi-frame zstd workers (pack + extract decompress) and extract file writers |
 | `--quiet` | off | Suppress all non-error output (progress + `src -> dst`) |
 
 No arguments prints usage and exits with code `2`. Exit `1` if any path fails.
@@ -83,18 +84,18 @@ Use `--quiet` to keep stdout empty unless an error occurs (errors still go to st
 # Backup a file and a tree
 ./bkp notes.txt src/
 
-# Parallel jobs
+# Parallel jobs + zstd workers
 ./bkp -j 4 -c 8 data/*.csv project/
 
 # Shell globs (or let bkp expand patterns)
 ./bkp 'logs/*.log'
 
-# Extract
-./bkp -x project.20260714120000.tgz restored/
+# Extract (parallel file writes via -c)
+./bkp -c 8 -x project.20260714120000.tar.zst restored/
 
-# Compatible with system tar
-tar -tzf project.20260714120000.tgz
-tar -xzf project.20260714120000.tgz -C restored/
+# Compatible with system tar + zstd when installed
+zstd -d -c project.20260714120000.tar.zst | tar -tf -
+zstd -d -c project.20260714120000.tar.zst | tar -xf - -C restored/
 ```
 
 ## How it works
@@ -102,11 +103,11 @@ tar -xzf project.20260714120000.tgz -C restored/
 | Input | Output |
 |-------|--------|
 | Regular file | Byte copy next to the source, suffix `.<YYYYMMDDHHMMSS>` |
-| Directory | Walk with `lstat` → ustar members (`0` file, `5` dir, `2` symlink, `1` hardlink) → gzip → `.tgz` |
+| Directory | Walk with `lstat` → ustar members (`0` file, `5` dir, `2` symlink, `1` hardlink) → multi-frame zstd → `.tar.zst` |
 
 Hardlinks share an inode: the first copy stores data; later names reference it. Symlinks store the link target, not the pointed-to content.
 
-Extract rejects path traversal (`..`, absolute names) before writing under the destination.
+Packing splits the tar into independent zstd frames (when `-c` > 1 and the tree is large enough) so both compress and decompress scale across cores. Extract inflates frames in parallel, creates directories, writes regular files in parallel, then applies symlinks/hardlinks. Path traversal (`..`, absolute names) is rejected before writing under the destination.
 
 ## Test
 
@@ -114,7 +115,7 @@ Extract rejects path traversal (`..`, absolute names) before writing under the d
 make test
 ```
 
-Covers file copy, nested tree, symlink, hardlink, `tar -tzf`, and `bkp -x`.
+Covers file copy, nested tree, symlink, hardlink, and `bkp -x`.
 
 ## Releases
 
@@ -132,8 +133,8 @@ Publishing a GitHub Release runs [`.github/workflows/release.yml`](.github/workf
 | Path | Role |
 |------|------|
 | `src/` | Odin sources (CLI, tar write/read, copy) |
-| `vendor/miniz.*` | Embedded DEFLATE / gzip |
-| `vendor/bkp_miniz_wrap.c` | Thin C API used from Odin |
+| `vendor/zstd/` | Embedded [zstd](https://github.com/facebook/zstd) library |
+| `vendor/bkp_zstd_wrap.c` | Thin C API used from Odin |
 | `build/` | Local objects / static lib (not tracked) |
 | `.github/workflows/` | Multi-arch release builds |
 
@@ -141,4 +142,4 @@ Publishing a GitHub Release runs [`.github/workflows/release.yml`](.github/workf
 
 **bkp** is licensed under the [GNU Affero General Public License v3.0](LICENSE) (AGPL-3.0).
 
-Bundled [miniz](https://github.com/richgel999/miniz) retains its own license (see `vendor/MINIZ_LICENSE`).
+Bundled [zstd](https://github.com/facebook/zstd) retains its own licenses (see `vendor/zstd/LICENSE` and `vendor/zstd/COPYING`).

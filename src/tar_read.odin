@@ -1,14 +1,45 @@
 package main
 
-import "core:bytes"
-import "core:compress/gzip"
+import "core:c"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:sync"
+import "core:thread"
 
-// extract_tgz unpacks a gzip-compressed tar into dest_dir.
-// Prints archive -> dest on success via caller.
-extract_tgz :: proc(archive, dest_dir: string) -> bool {
+Extract_Kind :: enum {
+	Dir,
+	File,
+	Symlink,
+	Hardlink,
+}
+
+Extract_Op :: struct {
+	kind:        Extract_Kind,
+	path:        string, // absolute-ish dest path (from safe_join)
+	link_target: string, // symlink text or hardlink target path
+	mode:        i64,
+	payload:     []u8, // view into tar buffer for files
+}
+
+Zstd_Frame :: struct {
+	comp_off: int,
+	comp_len: int,
+	out_off:  int,
+	out_len:  int,
+}
+
+Zstd_Frame_Job :: struct {
+	zst:       []u8,
+	tar:       []u8,
+	frame:     Zstd_Frame,
+	fail_flag: ^bool,
+	fail_mu:   ^sync.Mutex,
+}
+
+// extract_tar_zst unpacks a zstd-compressed tar into dest_dir.
+// workers: parallel frame decompress + parallel regular-file writes.
+extract_tar_zst :: proc(archive, dest_dir: string, workers: int) -> bool {
 	if !os.exists(archive) {
 		eprintfln("Error: Not found: %s", archive)
 		return false
@@ -24,25 +55,277 @@ extract_tgz :: proc(archive, dest_dir: string) -> bool {
 		return false
 	}
 
-	gz_data, rerr := os.read_entire_file(archive, context.allocator)
+	zst_data, rerr := os.read_entire_file(archive, context.allocator)
 	if rerr != nil {
 		eprintfln("Error: read %s: %v", archive, rerr)
 		return false
 	}
-	defer delete(gz_data)
+	defer delete(zst_data)
 
-	buf: bytes.Buffer
-	defer bytes.buffer_destroy(&buf)
-	if gerr := gzip.load(data = gz_data, buf = &buf); gerr != nil {
-		eprintfln("Error: gunzip %s: %v", archive, gerr)
+	tar_data, dok := zstd_decompress_parallel(zst_data, max(1, workers))
+	if !dok {
+		eprintfln("Error: zstd decompress failed for %s", archive)
 		return false
 	}
+	defer delete(tar_data)
 
-	tar_data := bytes.buffer_to_bytes(&buf)
-	return extract_tar_bytes(tar_data, dest)
+	return extract_tar_bytes(tar_data, dest, max(1, workers))
 }
 
-extract_tar_bytes :: proc(data: []u8, dest_dir: string) -> bool {
+// zstd_decompress_parallel scans independent frames and inflates them with a worker pool.
+// Single-frame archives (and serial multi-frame) both work.
+zstd_decompress_parallel :: proc(zst: []u8, workers: int) -> (tar: []u8, ok: bool) {
+	frames, fok := zstd_scan_frames(zst)
+	if !fok {
+		return nil, false
+	}
+	defer delete(frames)
+
+	if len(frames) == 0 {
+		return make([]u8, 0), true
+	}
+
+	total_out := 0
+	for f in frames {
+		total_out += f.out_len
+	}
+	tar = make([]u8, total_out)
+
+	if len(frames) == 1 || workers <= 1 {
+		for f in frames {
+			src := zst[f.comp_off:f.comp_off + f.comp_len]
+			dst := tar[f.out_off:f.out_off + f.out_len]
+			out_len: c.size_t
+			if bkp_zstd_decompress_into(
+				   raw_data(src),
+				   c.size_t(len(src)),
+				   raw_data(dst),
+				   c.size_t(len(dst)),
+				   &out_len,
+			   ) !=
+			   0 {
+				delete(tar)
+				return nil, false
+			}
+			if int(out_len) != f.out_len {
+				delete(tar)
+				return nil, false
+			}
+		}
+		return tar, true
+	}
+
+	fail_flag: bool
+	fail_mu: sync.Mutex
+	jobs := make([]Zstd_Frame_Job, len(frames))
+	defer delete(jobs)
+
+	n_pool := min(max(1, workers), len(frames))
+	pool: thread.Pool
+	thread.pool_init(&pool, context.allocator, n_pool)
+	defer thread.pool_destroy(&pool)
+
+	for i in 0 ..< len(frames) {
+		jobs[i] = Zstd_Frame_Job {
+			zst       = zst,
+			tar       = tar,
+			frame     = frames[i],
+			fail_flag = &fail_flag,
+			fail_mu   = &fail_mu,
+		}
+		thread.pool_add_task(&pool, context.allocator, zstd_frame_decompress_task, &jobs[i], i)
+	}
+	thread.pool_start(&pool)
+	thread.pool_finish(&pool)
+
+	if fail_flag {
+		delete(tar)
+		return nil, false
+	}
+	return tar, true
+}
+
+zstd_scan_frames :: proc(zst: []u8) -> (frames: [dynamic]Zstd_Frame, ok: bool) {
+	frames = make([dynamic]Zstd_Frame)
+	off := 0
+	out_off := 0
+	UNKNOWN :: ~c.size_t(0)
+	for off < len(zst) {
+		remain := zst[off:]
+		csize_c := bkp_zstd_frame_compressed_size(raw_data(remain), c.size_t(len(remain)))
+		csize := int(csize_c)
+		if csize_c == 0 || csize <= 0 || csize > len(remain) {
+			delete(frames)
+			return nil, false
+		}
+		usize_c := bkp_zstd_frame_content_size(raw_data(remain), c.size_t(csize))
+		if usize_c == UNKNOWN {
+			delete(frames)
+			return nil, false
+		}
+		usize := int(usize_c)
+		append(
+			&frames,
+			Zstd_Frame{comp_off = off, comp_len = csize, out_off = out_off, out_len = usize},
+		)
+		off += csize
+		out_off += usize
+	}
+	return frames, true
+}
+
+zstd_frame_decompress_task :: proc(t: thread.Task) {
+	job := cast(^Zstd_Frame_Job)t.data
+	sync.mutex_lock(job.fail_mu)
+	already := job.fail_flag^
+	sync.mutex_unlock(job.fail_mu)
+	if already {
+		return
+	}
+
+	f := job.frame
+	src := job.zst[f.comp_off:f.comp_off + f.comp_len]
+	dst := job.tar[f.out_off:f.out_off + f.out_len]
+	out_len: c.size_t
+	if bkp_zstd_decompress_into(
+		   raw_data(src),
+		   c.size_t(len(src)),
+		   raw_data(dst),
+		   c.size_t(len(dst)),
+		   &out_len,
+	   ) !=
+	   0 ||
+	   int(out_len) != f.out_len {
+		sync.mutex_lock(job.fail_mu)
+		job.fail_flag^ = true
+		sync.mutex_unlock(job.fail_mu)
+	}
+}
+
+extract_tar_bytes :: proc(data: []u8, dest_dir: string, workers: int) -> bool {
+	ops, ok := parse_tar_ops(data, dest_dir)
+	if !ok {
+		return false
+	}
+	defer destroy_extract_ops(ops)
+
+	// Phase D: directories first.
+	for op in ops {
+		if op.kind != .Dir {
+			continue
+		}
+		if err := os.make_directory_all(op.path, perm_from_mode(op.mode, true)); err != nil &&
+		   !os.is_directory(op.path) {
+			eprintfln("Error: mkdir %s: %v", op.path, err)
+			return false
+		}
+	}
+
+	// Phase F: regular files in parallel.
+	file_indices := make([dynamic]int)
+	defer delete(file_indices)
+	for op, i in ops {
+		if op.kind == .File {
+			append(&file_indices, i)
+		}
+	}
+
+	if len(file_indices) > 0 {
+		n_workers := min(max(1, workers), len(file_indices))
+		fail_flag: bool
+		fail_mu: sync.Mutex
+
+		pool: thread.Pool
+		thread.pool_init(&pool, context.allocator, n_workers)
+		defer thread.pool_destroy(&pool)
+
+		// Tasks hold pointers into ops; ops is stable for the pool lifetime.
+		jobs := make([]Extract_File_Job, len(file_indices))
+		defer delete(jobs)
+
+		for fi, j in file_indices {
+			jobs[j] = Extract_File_Job {
+				op        = &ops[fi],
+				fail_flag = &fail_flag,
+				fail_mu   = &fail_mu,
+			}
+			thread.pool_add_task(&pool, context.allocator, extract_file_task, &jobs[j], j)
+		}
+		thread.pool_start(&pool)
+		thread.pool_finish(&pool)
+
+		if fail_flag {
+			return false
+		}
+	}
+
+	// Phase L: symlinks then hardlinks (targets must exist).
+	for op in ops {
+		if op.kind != .Symlink {
+			continue
+		}
+		parent := filepath.dir(op.path)
+		_ = os.make_directory_all(parent)
+		if os.exists(op.path) {
+			_ = os.remove(op.path)
+		}
+		if err := os.symlink(op.link_target, op.path); err != nil {
+			eprintfln("Error: symlink %s -> %s: %v", op.path, op.link_target, err)
+			return false
+		}
+	}
+	for op in ops {
+		if op.kind != .Hardlink {
+			continue
+		}
+		parent := filepath.dir(op.path)
+		_ = os.make_directory_all(parent)
+		if os.exists(op.path) {
+			_ = os.remove(op.path)
+		}
+		if err := os.link(op.link_target, op.path); err != nil {
+			eprintfln("Error: link %s -> %s: %v", op.path, op.link_target, err)
+			return false
+		}
+	}
+	return true
+}
+
+Extract_File_Job :: struct {
+	op:        ^Extract_Op,
+	fail_flag: ^bool,
+	fail_mu:   ^sync.Mutex,
+}
+
+extract_file_task :: proc(t: thread.Task) {
+	job := cast(^Extract_File_Job)t.data
+	sync.mutex_lock(job.fail_mu)
+	already := job.fail_flag^
+	sync.mutex_unlock(job.fail_mu)
+	if already {
+		return
+	}
+
+	op := job.op
+	parent := filepath.dir(op.path)
+	if err := os.make_directory_all(parent); err != nil && !os.is_directory(parent) {
+		eprintfln("Error: mkdir %s: %v", parent, err)
+		sync.mutex_lock(job.fail_mu)
+		job.fail_flag^ = true
+		sync.mutex_unlock(job.fail_mu)
+		return
+	}
+	if err := os.write_entire_file(op.path, op.payload, perm_from_mode(op.mode, false)); err != nil {
+		eprintfln("Error: write %s: %v", op.path, err)
+		sync.mutex_lock(job.fail_mu)
+		job.fail_flag^ = true
+		sync.mutex_unlock(job.fail_mu)
+		return
+	}
+}
+
+parse_tar_ops :: proc(data: []u8, dest_dir: string) -> (ops: [dynamic]Extract_Op, ok: bool) {
+	ops = make([dynamic]Extract_Op)
 	off := 0
 	for off + 512 <= len(data) {
 		hdr := data[off:off + 512]
@@ -50,16 +333,14 @@ extract_tar_bytes :: proc(data: []u8, dest_dir: string) -> bool {
 
 		if is_zero_block(hdr) {
 			// End of archive (one or two zero blocks)
-			if off + 512 <= len(data) && is_zero_block(data[off:off + 512]) {
-				return true
-			}
-			return true
+			return ops, true
 		}
 
 		name := ustar_full_name(hdr)
 		if name == "" {
 			eprintfln("Error: empty tar member name")
-			return false
+			destroy_extract_ops(ops)
+			return nil, false
 		}
 
 		typeflag := hdr[156]
@@ -72,7 +353,9 @@ extract_tar_bytes :: proc(data: []u8, dest_dir: string) -> bool {
 		if size > 0 {
 			if off + int(size) > len(data) {
 				eprintfln("Error: truncated tar payload for %s", name)
-				return false
+				destroy_extract_ops(ops)
+				delete(name)
+				return nil, false
 			}
 			payload = data[off:off + int(size)]
 			off += int(size)
@@ -80,70 +363,69 @@ extract_tar_bytes :: proc(data: []u8, dest_dir: string) -> bool {
 			off += pad
 		}
 
-		// pax / gnu long name — minimal: skip unsupported special types with data
+		// pax / gnu long name — skip unsupported special types with data
 		if typeflag == 'x' || typeflag == 'g' || typeflag == 'L' || typeflag == 'K' {
-			// skip extended headers for v1 if we didn't write them
+			delete(name)
 			continue
 		}
 
-		safe, ok := safe_join(dest_dir, name)
-		if !ok {
+		safe, sok := safe_join(dest_dir, name)
+		if !sok {
 			eprintfln("Error: unsafe path in archive: %s", name)
-			return false
+			delete(name)
+			destroy_extract_ops(ops)
+			return nil, false
 		}
+		delete(name)
 
 		switch typeflag {
 		case '5', 'D':
-			// directory
-			if err := os.make_directory_all(safe, perm_from_mode(mode, true)); err != nil &&
-			   !os.is_directory(safe) {
-				eprintfln("Error: mkdir %s: %v", safe, err)
-				return false
-			}
+			append(
+				&ops,
+				Extract_Op{kind = .Dir, path = safe, mode = mode},
+			)
 		case '2':
-			// symlink
-			parent := filepath.dir(safe)
-			_ = os.make_directory_all(parent)
-			if os.exists(safe) {
-				_ = os.remove(safe)
-			}
-			if err := os.symlink(linkname, safe); err != nil {
-				eprintfln("Error: symlink %s -> %s: %v", safe, linkname, err)
-				return false
-			}
+			append(
+				&ops,
+				Extract_Op {
+					kind        = .Symlink,
+					path        = safe,
+					link_target = strings.clone(linkname),
+					mode        = mode,
+				},
+			)
 		case '1':
-			// hardlink
 			target, tok := safe_join(dest_dir, linkname)
 			if !tok {
 				eprintfln("Error: unsafe hardlink target: %s", linkname)
-				return false
+				delete(safe)
+				destroy_extract_ops(ops)
+				return nil, false
 			}
-			parent := filepath.dir(safe)
-			_ = os.make_directory_all(parent)
-			if os.exists(safe) {
-				_ = os.remove(safe)
-			}
-			if err := os.link(target, safe); err != nil {
-				eprintfln("Error: link %s -> %s: %v", safe, target, err)
-				return false
-			}
+			append(
+				&ops,
+				Extract_Op{kind = .Hardlink, path = safe, link_target = target, mode = mode},
+			)
 		case '0', '\x00', '7':
-			// regular file
-			parent := filepath.dir(safe)
-			if err := os.make_directory_all(parent); err != nil && !os.is_directory(parent) {
-				eprintfln("Error: mkdir %s: %v", parent, err)
-				return false
-			}
-			if err := os.write_entire_file(safe, payload, perm_from_mode(mode, false)); err != nil {
-				eprintfln("Error: write %s: %v", safe, err)
-				return false
-			}
+			append(
+				&ops,
+				Extract_Op{kind = .File, path = safe, mode = mode, payload = payload},
+			)
 		case:
-			// ignore other types
+			delete(safe)
 			continue
 		}
 	}
-	return true
+	return ops, true
+}
+
+destroy_extract_ops :: proc(ops: [dynamic]Extract_Op) {
+	for &op in ops {
+		delete(op.path)
+		delete(op.link_target)
+		// payload is a view into tar buffer — not owned
+	}
+	delete(ops)
 }
 
 is_zero_block :: proc(b: []u8) -> bool {

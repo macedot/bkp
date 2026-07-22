@@ -3,33 +3,49 @@ CC      ?= cc
 CFLAGS  ?= -O2 -fPIC -Ivendor
 ODIN    ?= odin
 BUILD   := build
-LIB     := $(BUILD)/libbkpminiz.a
-OBJS    := $(BUILD)/miniz.o $(BUILD)/bkp_miniz_wrap.o
+ZSTD_LIB_DIR := vendor/zstd/lib
+ZSTD_A  := $(ZSTD_LIB_DIR)/libzstd.a
+LIB     := $(BUILD)/libbkpzstd.a
 OUT     ?= bkp
 
-.PHONY: all clean test
+# Linux needs pthread for zstd multi-threaded compress; macOS has it in libSystem.
+UNAME_S := $(shell uname -s 2>/dev/null || echo unknown)
+ifeq ($(UNAME_S),Linux)
+  EXTRA_LINKER := -extra-linker-flags:"-lpthread"
+else
+  EXTRA_LINKER :=
+endif
+
+.PHONY: all clean test zstd
 
 all: $(OUT)
 
 $(BUILD):
 	mkdir -p $(BUILD)
 
-$(BUILD)/miniz.o: vendor/miniz.c vendor/miniz.h | $(BUILD)
-	$(CC) $(CFLAGS) -c -o $@ vendor/miniz.c
+# Multi-threaded static libzstd (nbWorkers support).
+$(ZSTD_A):
+	$(MAKE) -C $(ZSTD_LIB_DIR) libzstd.a-mt
 
-$(BUILD)/bkp_miniz_wrap.o: vendor/bkp_miniz_wrap.c vendor/miniz.h | $(BUILD)
-	$(CC) $(CFLAGS) -c -o $@ vendor/bkp_miniz_wrap.c
+$(BUILD)/bkp_zstd_wrap.o: vendor/bkp_zstd_wrap.c vendor/zstd/lib/zstd.h | $(BUILD)
+	$(CC) $(CFLAGS) -c -o $@ vendor/bkp_zstd_wrap.c
 
-$(LIB): $(OBJS)
-	ar rcs $@ $(OBJS)
+# Combine wrap + libzstd into one archive for Odin foreign import.
+$(LIB): $(BUILD)/bkp_zstd_wrap.o $(ZSTD_A) | $(BUILD)
+	rm -rf $(BUILD)/zstd_objs
+	mkdir -p $(BUILD)/zstd_objs
+	cd $(BUILD)/zstd_objs && ar x ../../$(ZSTD_A)
+	ar rcs $@ $(BUILD)/zstd_objs/*.o $(BUILD)/bkp_zstd_wrap.o
+	rm -rf $(BUILD)/zstd_objs
 
 $(OUT): $(LIB) src/*.odin
-	$(ODIN) build src -out:$(OUT) -o:speed
+	$(ODIN) build src -out:$(OUT) -o:speed $(EXTRA_LINKER)
 
 clean:
 	rm -rf $(BUILD) bkp bkp.exe
+	$(MAKE) -C $(ZSTD_LIB_DIR) clean >/dev/null 2>&1 || true
 
-# Functional smoke: file copy, .tgz with symlink+hardlink, extract
+# Functional smoke: file copy, .tar.zst with symlink+hardlink, extract
 test: $(OUT)
 	@set -e; \
 	TMP=$$(mktemp -d); \
@@ -44,27 +60,43 @@ test: $(OUT)
 	test -z "$$(cat "$$TMP/err")" || (echo "STDERR:" && cat "$$TMP/err" && exit 1); \
 	echo "$$OUT_TXT" | grep -q 'a.txt -> a.txt.'; \
 	echo "$$OUT_TXT" | grep -q 'dir -> dir.'; \
-	TGZ=$$(ls "$$TMP"/dir.*.tgz); \
-	tar -tzf "$$TGZ" | grep -q 'dir/sub/b.txt'; \
-	tar -tzf "$$TGZ" | grep -q 'dir/link.txt'; \
+	TZST=$$(ls "$$TMP"/dir.*.tar.zst); \
+	test -f "$$TZST"; \
 	diff -u "$$TMP/a.txt" "$$TMP"/a.txt.*; \
 	mkdir -p "$$TMP/out"; \
-	XOUT=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" -x "$$(basename "$$TGZ")" out 2>"$$TMP/err2"); \
+	XOUT=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" -c 2 -x "$$(basename "$$TZST")" out 2>"$$TMP/err2"); \
 	echo "$$XOUT"; \
 	test -z "$$(cat "$$TMP/err2")" || (echo "STDERR:" && cat "$$TMP/err2" && exit 1); \
 	test "$$(readlink "$$TMP/out/dir/link.txt")" = "a.txt"; \
 	diff -u "$$TMP/dir/a.txt" "$$TMP/out/dir/hard.txt"; \
+	diff -u "$$TMP/dir/sub/b.txt" "$$TMP/out/dir/sub/b.txt"; \
 	echo quiet > "$$TMP/q.txt"; \
 	mkdir -p "$$TMP/qd/sub"; \
 	echo zipped > "$$TMP/qd/sub/z.txt"; \
 	QOUT=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" --quiet q.txt qd 2>"$$TMP/errq"); \
 	test -z "$$QOUT" || (echo "Expected empty stdout with --quiet backup" && echo "$$QOUT" && exit 1); \
 	test -z "$$(cat "$$TMP/errq")" || (echo "STDERR (--quiet backup):" && cat "$$TMP/errq" && exit 1); \
-	QTGZ=$$(ls "$$TMP"/qd.*.tgz); \
+	QZST=$$(ls "$$TMP"/qd.*.tar.zst); \
 	mkdir -p "$$TMP/outq"; \
-	QXOUT=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" --quiet -x "$$(basename "$$QTGZ")" outq 2>"$$TMP/errq2"); \
+	QXOUT=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" --quiet -x "$$(basename "$$QZST")" outq 2>"$$TMP/errq2"); \
 	test -z "$$QXOUT" || (echo "Expected empty stdout with --quiet extract" && echo "$$QXOUT" && exit 1); \
 	test -z "$$(cat "$$TMP/errq2")" || (echo "STDERR (--quiet extract):" && cat "$$TMP/errq2" && exit 1); \
 	diff -u "$$TMP/qd/sub/z.txt" "$$TMP/outq/qd/sub/z.txt"; \
+	mkdir -p "$$TMP/big/sub"; \
+	dd if=/dev/zero bs=1024 count=1536 2>/dev/null | tr '\0' 'Z' > "$$TMP/big/a.bin"; \
+	dd if=/dev/urandom bs=1024 count=256 2>/dev/null > "$$TMP/big/b.bin"; \
+	echo x > "$$TMP/big/sub/c.txt"; \
+	ln -s c.txt "$$TMP/big/sub/link.txt"; \
+	BOUT=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" --quiet -c 4 big 2>"$$TMP/errb"); \
+	test -z "$$BOUT"; \
+	test -z "$$(cat "$$TMP/errb")" || (echo "STDERR (big pack):" && cat "$$TMP/errb" && exit 1); \
+	BTGZ=$$(ls "$$TMP"/big.*.tar.zst); \
+	mkdir -p "$$TMP/outb"; \
+	BX=$$(cd "$$TMP" && "$(CURDIR)/$(OUT)" --quiet -c 4 -x "$$(basename "$$BTGZ")" outb 2>"$$TMP/errbx"); \
+	test -z "$$BX"; \
+	test -z "$$(cat "$$TMP/errbx")" || (echo "STDERR (big extract):" && cat "$$TMP/errbx" && exit 1); \
+	diff -q "$$TMP/big/a.bin" "$$TMP/outb/big/a.bin"; \
+	diff -q "$$TMP/big/b.bin" "$$TMP/outb/big/b.bin"; \
+	test "$$(readlink "$$TMP/outb/big/sub/link.txt")" = "c.txt"; \
 	echo "OK"; \
 	rm -rf "$$TMP"

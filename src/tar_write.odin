@@ -5,7 +5,18 @@ import "core:fmt"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
+import "core:thread"
 import "core:time"
+
+// Minimum uncompressed tar bytes per zstd frame when multi-frame packing.
+ZSTD_FRAME_CHUNK_MIN :: 1 * 1024 * 1024
+
+Zstd_Chunk_Job :: struct {
+	src:      []u8,
+	comp:     [^]u8,
+	comp_len: int,
+	err:      bool,
+}
 
 Tar_Kind :: enum {
 	File,
@@ -37,13 +48,13 @@ Tar_Pack_Progress :: struct {
 
 PROGRESS_ENTRY_STEP :: 32
 
-// tar_directory writes src tree to dst_tgz as gzip-compressed ustar (.tgz).
-// compress_workers kept for API compatibility; gzip stream is serial.
-tar_directory :: proc(src_path, dst_tgz: string, compress_workers: int) -> bool {
-	_ = compress_workers
+// tar_directory writes src tree to dst as zstd-compressed ustar (.tar.zst).
+// compress_workers: multi-frame parallel compress (independent zstd frames).
+tar_directory :: proc(src_path, dst_path: string, compress_workers: int) -> bool {
+	workers := max(1, compress_workers)
 
-	if os.exists(dst_tgz) {
-		eprintfln("Error: Destination exists: %s", dst_tgz)
+	if os.exists(dst_path) {
+		eprintfln("Error: Destination exists: %s", dst_path)
 		return false
 	}
 
@@ -75,33 +86,125 @@ tar_directory :: proc(src_path, dst_tgz: string, compress_workers: int) -> bool 
 		advance_pack_progress(&progress, &e)
 	}
 	finish_pack_progress(&progress, false)
-	print_progress_update(progress_phase_line(base_name, "Compressing gzip stream"))
 	// Two zero blocks end the archive.
 	append_zeros(&tar_buf, 1024)
 
-	src_ptr: [^]u8 = nil
-	if len(tar_buf) > 0 {
-		src_ptr = raw_data(tar_buf)
-	}
-	out_len: c.size_t
-	gz := bkp_gzip_compress(src_ptr, c.size_t(len(tar_buf)), &out_len)
-	if gz == nil {
+	print_progress_update(
+		progress_phase_line(base_name, fmt.tprintf("Compressing zstd (%d workers)", workers)),
+		false,
+	)
+
+	comp, cok := zstd_compress_tar_parallel(tar_buf[:], workers)
+	if !cok {
 		finish_pack_progress(&progress, false)
-		eprintfln("Error: gzip compress failed for %s", src)
+		eprintfln("Error: zstd compress failed for %s", src)
 		return false
 	}
-	defer bkp_free(gz)
+	defer delete(comp)
 
-	gz_slice := ([^]u8)(gz)[:int(out_len)]
-	print_progress_update(progress_phase_line(base_name, "Writing archive"))
-	if err := os.write_entire_file(dst_tgz, gz_slice); err != nil {
+	print_progress_update(progress_phase_line(base_name, "Writing archive"), false)
+	if err := os.write_entire_file(dst_path, comp); err != nil {
 		finish_pack_progress(&progress, false)
-		_ = os.remove(dst_tgz)
-		eprintfln("Error: write %s: %v", dst_tgz, err)
+		_ = os.remove(dst_path)
+		eprintfln("Error: write %s: %v", dst_path, err)
 		return false
 	}
 	finish_pack_progress(&progress, true)
 	return true
+}
+
+// zstd_compress_tar_parallel emits one or more independent zstd frames so extract
+// can decompress frames in parallel. Level 1 for fast backups.
+zstd_compress_tar_parallel :: proc(tar: []u8, workers: int) -> (out: []u8, ok: bool) {
+	workers := max(1, workers)
+	tar_len := len(tar)
+
+	// Single frame when small or single worker.
+	if workers == 1 || tar_len <= ZSTD_FRAME_CHUNK_MIN {
+		src_ptr: [^]u8 = nil
+		if tar_len > 0 {
+			src_ptr = raw_data(tar)
+		}
+		out_len: c.size_t
+		comp := bkp_zstd_compress(src_ptr, c.size_t(tar_len), 1, c.int(workers), &out_len)
+		if comp == nil {
+			return nil, false
+		}
+		// Copy into Odin-owned slice so callers can delete() uniformly.
+		out = make([]u8, int(out_len))
+		copy(out, ([^]u8)(comp)[:int(out_len)])
+		bkp_free(comp)
+		return out, true
+	}
+
+	// Target ~workers*4 chunks, each at least CHUNK_MIN (except last).
+	chunk_size := max(ZSTD_FRAME_CHUNK_MIN, (tar_len + workers * 4 - 1) / (workers * 4))
+	n_chunks := (tar_len + chunk_size - 1) / chunk_size
+	if n_chunks < 1 {
+		n_chunks = 1
+	}
+
+	jobs := make([]Zstd_Chunk_Job, n_chunks)
+	defer {
+		for &j in jobs {
+			if j.comp != nil {
+				bkp_free(j.comp)
+				j.comp = nil
+			}
+		}
+		delete(jobs)
+	}
+
+	off := 0
+	for i in 0 ..< n_chunks {
+		end := min(off + chunk_size, tar_len)
+		jobs[i].src = tar[off:end]
+		off = end
+	}
+
+	n_pool := min(workers, n_chunks)
+	pool: thread.Pool
+	thread.pool_init(&pool, context.allocator, n_pool)
+	defer thread.pool_destroy(&pool)
+
+	for i in 0 ..< n_chunks {
+		thread.pool_add_task(&pool, context.allocator, zstd_chunk_compress_task, &jobs[i], i)
+	}
+	thread.pool_start(&pool)
+	thread.pool_finish(&pool)
+
+	total := 0
+	for j in jobs {
+		if j.err || j.comp == nil {
+			return nil, false
+		}
+		total += j.comp_len
+	}
+
+	out = make([]u8, total)
+	w := 0
+	for j in jobs {
+		copy(out[w:w + j.comp_len], ([^]u8)(j.comp)[:j.comp_len])
+		w += j.comp_len
+	}
+	return out, true
+}
+
+zstd_chunk_compress_task :: proc(t: thread.Task) {
+	job := cast(^Zstd_Chunk_Job)t.data
+	src_ptr: [^]u8 = nil
+	if len(job.src) > 0 {
+		src_ptr = raw_data(job.src)
+	}
+	out_len: c.size_t
+	// One frame per chunk; no nested MT (workers=1).
+	comp := bkp_zstd_compress(src_ptr, c.size_t(len(job.src)), 1, 1, &out_len)
+	if comp == nil {
+		job.err = true
+		return
+	}
+	job.comp = comp
+	job.comp_len = int(out_len)
 }
 
 new_tar_pack_progress :: proc(label: string, entries: [dynamic]Tar_Entry) -> Tar_Pack_Progress {

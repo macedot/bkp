@@ -45,21 +45,20 @@ print_usage :: proc() {
 	}
 	fmt.eprintf(
 		`Usage: %s [--quiet] [-j N] [-c N] <file|directory|pattern> ...
-       %s -x <archive.tgz> [dest_dir]
+       %s [-c N] -x <archive.tar.zst> [dest_dir]
 
   Backup (default):
     Files  → copy to <path>.<timestamp>
-    Dirs   → <path>.<timestamp>.tgz  (ustar + gzip level 1; symlinks/hardlinks)
+    Dirs   → <path>.<timestamp>.tar.zst  (ustar + zstd level 1; symlinks/hardlinks)
 
   Extract:
-    -x     Unpack .tgz / .tar.gz into dest_dir (default: .)
+    -x     Unpack .tar.zst into dest_dir (default: .)
 
   -j N   Max entities to process in parallel (default: CPU count)
-  -c N   Parallel entry prep while building tar (default: CPU count)
-         Note: gzip stream itself is serial
-	--quiet   Suppress all non-error output
+  -c N   multi-frame zstd workers + extract file writers (default: CPU count)
+  --quiet   Suppress all non-error output
 
-	Prints only: src -> dst and live pack progress
+  Prints only: src -> dst and live pack progress
   Errors go to stderr.
 `,
 		prog,
@@ -235,7 +234,7 @@ main :: proc() {
 
 	if extract_mode {
 		if len(patterns) < 1 || len(patterns) > 2 {
-			eprintfln("Error: -x requires <archive.tgz> [dest_dir]")
+			eprintfln("Error: -x requires <archive.tar.zst> [dest_dir]")
 			print_usage()
 			os.exit(2)
 		}
@@ -243,7 +242,7 @@ main :: proc() {
 		if len(patterns) == 2 {
 			extract_dest = patterns[1]
 		}
-		if extract_tgz(extract_archive, extract_dest) {
+		if extract_tar_zst(extract_archive, extract_dest, cores_n) {
 			print_src_dst(extract_archive, extract_dest)
 			os.exit(0)
 		}
